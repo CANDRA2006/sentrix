@@ -18,6 +18,25 @@ app = typer.Typer(
 )
 console = Console()
 
+TOOL_NAME = "SENTRIX"
+TOOL_VERSION = "0.1.0"
+REPORT_SCHEMA_VERSION = "1.0"
+REQUEST_TIMEOUT_SECONDS = 8.0
+MAX_REDIRECTS = 5
+SEVERITY_ORDER = ("HIGH", "MEDIUM", "LOW", "INFO")
+LIMITATIONS = [
+    "Checks response headers only.",
+    "Missing headers are observations, not proof of exploitation.",
+    "Severity is a rule-based triage label, not a CVSS score.",
+    "No vulnerability exploitation is performed.",
+]
+
+
+@app.callback()
+def main() -> None:
+    """Local-first security posture analysis CLI."""
+
+
 RULES = [
     {
         "id": "HTTP-001",
@@ -126,6 +145,43 @@ def analyze_headers(headers: httpx.Headers, is_https: bool) -> list[dict]:
     return findings
 
 
+def build_report(
+    requested_url: str,
+    response: httpx.Response,
+    findings: list[dict],
+) -> dict:
+    """Build the JSON-serializable report without leaking header values."""
+    return {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "tool": {
+            "name": TOOL_NAME,
+            "version": TOOL_VERSION,
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "target": {
+            "requested_url": requested_url,
+            "final_url": str(response.url),
+        },
+        "http": {
+            "status_code": response.status_code,
+            "final_scheme": response.url.scheme,
+            "redirect_count": len(response.history),
+        },
+        "summary": {
+            "findings": len(findings),
+            "by_severity": {
+                severity: sum(
+                    finding["severity"] == severity
+                    for finding in findings
+                )
+                for severity in SEVERITY_ORDER
+            },
+        },
+        "findings": findings,
+        "limitations": list(LIMITATIONS),
+    }
+
+
 @app.command()
 def check(
     url: str = typer.Argument(
@@ -147,10 +203,10 @@ def check(
 
     try:
         with httpx.Client(
-            timeout=8.0,
+            timeout=REQUEST_TIMEOUT_SECONDS,
             follow_redirects=True,
-            max_redirects=5,
-            headers={"User-Agent": "SENTRIX/0.1.0"},
+            max_redirects=MAX_REDIRECTS,
+            headers={"User-Agent": f"{TOOL_NAME}/{TOOL_VERSION}"},
         ) as client:
             response = client.get(url)
 
@@ -163,40 +219,7 @@ def check(
         is_https=response.url.scheme == "https",
     )
 
-    report = {
-        "schema_version": "1.0",
-        "tool": {
-            "name": "SENTRIX",
-            "version": "0.1.0",
-        },
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "target": {
-            "requested_url": url,
-            "final_url": str(response.url),
-        },
-        "http": {
-            "status_code": response.status_code,
-            "final_scheme": response.url.scheme,
-            "redirect_count": len(response.history),
-        },
-        "summary": {
-            "findings": len(findings),
-            "by_severity": {
-                severity: sum(
-                    finding["severity"] == severity
-                    for finding in findings
-                )
-                for severity in ("HIGH", "MEDIUM", "LOW", "INFO")
-            },
-        },
-        "findings": findings,
-        "limitations": [
-            "Checks response headers only.",
-            "Missing headers are observations, not proof of exploitation.",
-            "Severity is a rule-based triage label, not a CVSS score.",
-            "No vulnerability exploitation is performed.",
-        ],
-    }
+    report = build_report(url, response, findings)
 
     table = Table(title="HTTP Security Posture")
     table.add_column("Rule ID")
