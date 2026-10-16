@@ -11,6 +11,10 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from sentrix.models import SEVERITY_ORDER
+from sentrix.normalize import normalize_findings
+from sentrix.rules import evaluate_headers
+
 app = typer.Typer(
     name="sentrix",
     help="Local-first security posture analysis CLI.",
@@ -23,7 +27,6 @@ TOOL_VERSION = "0.1.0"
 REPORT_SCHEMA_VERSION = "1.0"
 REQUEST_TIMEOUT_SECONDS = 8.0
 MAX_REDIRECTS = 5
-SEVERITY_ORDER = ("HIGH", "MEDIUM", "LOW", "INFO")
 LIMITATIONS = [
     "Checks response headers only.",
     "Missing headers are observations, not proof of exploitation.",
@@ -35,62 +38,6 @@ LIMITATIONS = [
 @app.callback()
 def main() -> None:
     """Local-first security posture analysis CLI."""
-
-
-RULES = [
-    {
-        "id": "HTTP-001",
-        "header": "content-security-policy",
-        "title": "Content Security Policy tidak ditemukan",
-        "severity": "MEDIUM",
-        "recommendation": (
-            "Evaluasi Content-Security-Policy sesuai "
-            "arsitektur aplikasi dan uji sebelum diterapkan."
-        ),
-        "https_only": False,
-    },
-    {
-        "id": "HTTP-002",
-        "header": "strict-transport-security",
-        "title": "HSTS tidak ditemukan",
-        "severity": "MEDIUM",
-        "recommendation": (
-            "Untuk situs HTTPS, evaluasi Strict-Transport-Security "
-            "setelah memastikan seluruh alur mendukung HTTPS."
-        ),
-        "https_only": True,
-    },
-    {
-        "id": "HTTP-003",
-        "header": "x-content-type-options",
-        "title": "X-Content-Type-Options tidak ditemukan",
-        "severity": "LOW",
-        "recommendation": (
-            "Evaluasi penggunaan X-Content-Type-Options: nosniff."
-        ),
-        "https_only": False,
-    },
-    {
-        "id": "HTTP-004",
-        "header": "referrer-policy",
-        "title": "Referrer-Policy tidak ditemukan",
-        "severity": "LOW",
-        "recommendation": (
-            "Tentukan Referrer-Policy yang sesuai kebutuhan privasi."
-        ),
-        "https_only": False,
-    },
-    {
-        "id": "HTTP-005",
-        "header": "permissions-policy",
-        "title": "Permissions-Policy tidak ditemukan",
-        "severity": "INFO",
-        "recommendation": (
-            "Evaluasi pembatasan fitur browser yang tidak diperlukan."
-        ),
-        "https_only": False,
-    },
-]
 
 
 def validate_url(url: str) -> str:
@@ -115,34 +62,9 @@ def validate_url(url: str) -> str:
 
 
 def analyze_headers(headers: httpx.Headers, is_https: bool) -> list[dict]:
-    """Generate findings using deterministic local rules."""
-    findings = []
-
-    for rule in RULES:
-        if rule["https_only"] and not is_https:
-            continue
-
-        value = headers.get(rule["header"])
-
-        if value:
-            continue
-
-        findings.append(
-            {
-                "id": rule["id"],
-                "title": rule["title"],
-                "severity": rule["severity"],
-                "confidence": "HIGH",
-                "evidence": {
-                    "type": "missing_response_header",
-                    "header": rule["header"],
-                },
-                "recommendation": rule["recommendation"],
-                "status": "observed",
-            }
-        )
-
-    return findings
+    """Generate normalized findings as report-ready dicts."""
+    findings = normalize_findings(evaluate_headers(headers, is_https))
+    return [finding.to_dict() for finding in findings]
 
 
 def build_report(
