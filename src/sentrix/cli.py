@@ -9,9 +9,21 @@ from urllib.parse import urlsplit
 import httpx
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
-from sentrix.models import SEVERITY_ORDER
+from sentrix.history import (
+    DB_ENV_VAR,
+    HistoryError,
+    ScanDiff,
+    StoredFinding,
+    compare_scans,
+    default_db_path,
+    list_scans,
+    open_history,
+    save_scan,
+)
+from sentrix.models import SEVERITY_ORDER, Finding
 from sentrix.normalize import normalize_findings
 from sentrix.rules import evaluate_headers
 
@@ -61,10 +73,26 @@ def validate_url(url: str) -> str:
     return url
 
 
+def evaluate_findings(
+    headers: httpx.Headers, is_https: bool
+) -> list[Finding]:
+    """Run the header rules and return normalized Finding objects."""
+    return normalize_findings(evaluate_headers(headers, is_https))
+
+
 def analyze_headers(headers: httpx.Headers, is_https: bool) -> list[dict]:
     """Generate normalized findings as report-ready dicts."""
-    findings = normalize_findings(evaluate_headers(headers, is_https))
-    return [finding.to_dict() for finding in findings]
+    return [
+        finding.to_dict() for finding in evaluate_findings(headers, is_https)
+    ]
+
+
+DbOption = typer.Option(
+    None,
+    "--db",
+    envvar=DB_ENV_VAR,
+    help="Path database riwayat SQLite (default: ~/.sentrix/history.db).",
+)
 
 
 def build_report(
@@ -116,6 +144,12 @@ def check(
         "-o",
         help="Simpan laporan ke file JSON.",
     ),
+    save: bool = typer.Option(
+        False,
+        "--save",
+        help="Simpan hasil scan ke riwayat lokal (SQLite).",
+    ),
+    db: Path | None = DbOption,
 ) -> None:
     """Inspect basic HTTP security headers for one URL."""
     validate_url(url)
@@ -136,10 +170,11 @@ def check(
         console.print(f"[bold red]Request gagal:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    findings = analyze_headers(
+    finding_objects = evaluate_findings(
         response.headers,
         is_https=response.url.scheme == "https",
     )
+    findings = [finding.to_dict() for finding in finding_objects]
 
     report = build_report(url, response, findings)
 
@@ -169,6 +204,134 @@ def check(
             encoding="utf-8",
         )
         console.print(f"[green]Laporan tersimpan:[/green] {output}")
+
+    if save:
+        try:
+            with open_history(db or default_db_path()) as conn:
+                scan_id = save_scan(
+                    conn,
+                    target=url,
+                    final_url=str(response.url),
+                    scanned_at=report["timestamp"],
+                    status_code=response.status_code,
+                    tool_version=TOOL_VERSION,
+                    findings=finding_objects,
+                )
+        except HistoryError as exc:
+            console.print(
+                f"[bold red]Riwayat gagal disimpan:[/bold red] {escape(str(exc))}"
+            )
+            raise typer.Exit(code=1) from exc
+
+        console.print(f"[green]Scan tersimpan di riwayat:[/green] #{scan_id}")
+
+
+@app.command("history")
+def history_command(
+    limit: int = typer.Option(
+        20, "--limit", "-n", min=1, max=500, help="Jumlah scan terbaru."
+    ),
+    db: Path | None = DbOption,
+) -> None:
+    """List saved scans, newest first."""
+    try:
+        with open_history(db or default_db_path()) as conn:
+            scans = list_scans(conn, limit)
+    except HistoryError as exc:
+        console.print(
+            f"[bold red]Riwayat gagal dibaca:[/bold red] {escape(str(exc))}"
+        )
+        raise typer.Exit(code=1) from exc
+
+    if not scans:
+        console.print(
+            "Belum ada scan tersimpan. Gunakan: sentrix check URL --save"
+        )
+        return
+
+    table = Table(title="Scan History")
+    table.add_column("ID", justify="right")
+    table.add_column("Waktu (UTC)")
+    table.add_column("Target")
+    table.add_column("HTTP", justify="right")
+    table.add_column("Findings", justify="right")
+
+    for scan in scans:
+        table.add_row(
+            str(scan.id),
+            escape(_short_time(scan.scanned_at)),
+            escape(scan.target),
+            str(scan.status_code),
+            str(scan.finding_count),
+        )
+
+    console.print(table)
+
+
+def _short_time(iso_timestamp: str) -> str:
+    """``2026-10-22T03:49:47.263+00:00`` -> ``2026-10-22 03:49:47``."""
+    return iso_timestamp[:19].replace("T", " ")
+
+
+def _finding_lines(label: str, style: str, items: list[StoredFinding]) -> None:
+    for item in items:
+        console.print(
+            f"[{style}]{label}[/{style}] {item.rule_id} "
+            f"{escape(f'[{item.severity.value}]')} {escape(item.title)}"
+        )
+
+
+def _print_diff(diff: ScanDiff) -> None:
+    console.print(
+        f"\n[bold cyan]SENTRIX[/bold cyan] :: COMPARE "
+        f"#{diff.old.id} -> #{diff.new.id}"
+    )
+    for label, scan in (("Lama", diff.old), ("Baru", diff.new)):
+        console.print(
+            f"[dim]{label}: {escape(scan.target)} "
+            f"({escape(scan.scanned_at)})[/dim]"
+        )
+    console.print()
+
+    if not diff.same_target:
+        console.print(
+            "[yellow]Peringatan:[/yellow] kedua scan memiliki target yang "
+            "berbeda; hasil perbandingan mungkin tidak bermakna.\n"
+        )
+
+    _finding_lines("BARU     ", "red", list(diff.appeared))
+    _finding_lines("TERATASI ", "green", list(diff.resolved))
+    for change in diff.severity_changed:
+        console.print(
+            f"[yellow]BERUBAH  [/yellow] {change.after.rule_id} "
+            f"{change.before.severity.value} -> {change.after.severity.value} "
+            f"{escape(change.after.title)}"
+        )
+
+    console.print(
+        f"\nBaru: {len(diff.appeared)} | Teratasi: {len(diff.resolved)} | "
+        f"Berubah severity: {len(diff.severity_changed)} | "
+        f"Tetap: {len(diff.unchanged)}"
+    )
+
+
+@app.command("compare")
+def compare_command(
+    old_id: int = typer.Argument(..., min=1, help="ID scan lama."),
+    new_id: int = typer.Argument(..., min=1, help="ID scan baru."),
+    db: Path | None = DbOption,
+) -> None:
+    """Compare two saved scans by finding fingerprint."""
+    try:
+        with open_history(db or default_db_path()) as conn:
+            diff = compare_scans(conn, old_id, new_id)
+    except HistoryError as exc:
+        console.print(
+            f"[bold red]Perbandingan gagal:[/bold red] {escape(str(exc))}"
+        )
+        raise typer.Exit(code=1) from exc
+
+    _print_diff(diff)
 
 
 if __name__ == "__main__":

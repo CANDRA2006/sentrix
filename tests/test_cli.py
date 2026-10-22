@@ -1,4 +1,5 @@
 import json
+import re
 from collections.abc import Callable
 
 import httpx
@@ -262,3 +263,208 @@ def test_user_agent_identifies_the_tool(mock_http):
     runner.invoke(app, ["check", "https://example.com"])
 
     assert seen[0].headers["user-agent"] == "SENTRIX/0.1.0"
+
+
+# --- scan history: --save, history, compare -------------------------------
+
+ALL_HEADERS = {
+    "Content-Security-Policy": "default-src 'self'",
+    "Strict-Transport-Security": "max-age=31536000",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "camera=()",
+}
+
+
+@pytest.fixture
+def db(tmp_path, monkeypatch):
+    """Isolated history database; never touches the real ~/.sentrix."""
+    path = tmp_path / "history.db"
+    monkeypatch.setenv("SENTRIX_DB", str(path))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    return path
+
+
+def test_check_without_save_does_not_create_database(mock_http, db):
+    mock_http(lambda request: httpx.Response(200))
+
+    result = runner.invoke(app, ["check", "https://example.com"])
+
+    assert result.exit_code == 0
+    assert not db.exists()
+    assert "riwayat" not in result.output.lower()
+
+
+def test_check_save_stores_scan_and_reports_id(mock_http, db):
+    mock_http(lambda request: httpx.Response(200))
+
+    result = runner.invoke(app, ["check", "https://example.com", "--save"])
+
+    assert result.exit_code == 0
+    assert "#1" in result.output
+    assert db.exists()
+
+
+def test_check_save_accepts_explicit_db_option(mock_http, tmp_path):
+    mock_http(lambda request: httpx.Response(200))
+    custom = tmp_path / "nested" / "custom.db"
+
+    result = runner.invoke(
+        app, ["check", "https://example.com", "--save", "--db", str(custom)]
+    )
+
+    assert result.exit_code == 0
+    assert custom.exists()
+
+
+def test_check_save_strips_query_and_never_stores_header_values(
+    mock_http, db
+):
+    mock_http(
+        lambda request: httpx.Response(
+            200, headers={"Set-Cookie": "session=TOP-SECRET-VALUE"}
+        )
+    )
+
+    result = runner.invoke(
+        app, ["check", "https://example.com/p?token=SECRET", "--save"]
+    )
+
+    assert result.exit_code == 0
+    raw = db.read_bytes()
+    assert b"SECRET" not in raw
+    assert b"TOP-SECRET-VALUE" not in raw
+
+
+def test_check_save_failure_exits_one_with_clear_message(mock_http, tmp_path):
+    mock_http(lambda request: httpx.Response(200))
+    # a directory cannot be opened as a database file
+    result = runner.invoke(
+        app,
+        ["check", "https://example.com", "--save", "--db", str(tmp_path)],
+    )
+
+    assert result.exit_code == 1
+    assert "Riwayat gagal disimpan" in result.output
+
+
+def test_failed_request_is_never_saved(mock_http, db):
+    def boom(request):
+        raise httpx.ConnectError("down", request=request)
+
+    mock_http(boom)
+
+    result = runner.invoke(app, ["check", "https://example.com", "--save"])
+
+    assert result.exit_code == 1
+    assert not db.exists()
+
+
+def test_history_on_missing_database_prints_hint(db):
+    result = runner.invoke(app, ["history"])
+
+    assert result.exit_code == 0
+    assert "Belum ada scan tersimpan" in result.output
+
+
+def test_history_lists_saved_scans_newest_first(mock_http, db):
+    mock_http(lambda request: httpx.Response(200))
+    runner.invoke(app, ["check", "https://first.example", "--save"])
+    runner.invoke(app, ["check", "https://second.example", "--save"])
+
+    result = runner.invoke(app, ["history"])
+
+    assert result.exit_code == 0
+    assert result.output.index("second.example") < result.output.index(
+        "first.example"
+    )
+
+
+def test_history_shows_untruncated_timestamp(mock_http, db):
+    mock_http(lambda request: httpx.Response(200))
+    runner.invoke(app, ["check", "https://example.com", "--save"])
+
+    result = runner.invoke(app, ["history"])
+
+    assert re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ", result.output)
+    assert "…" not in result.output.split("example.com")[0]
+
+
+def test_history_limit_option_is_validated_and_applied(mock_http, db):
+    mock_http(lambda request: httpx.Response(200))
+    for host in ("a", "b", "c"):
+        runner.invoke(app, ["check", f"https://{host}.example", "--save"])
+
+    limited = runner.invoke(app, ["history", "--limit", "1"])
+    invalid = runner.invoke(app, ["history", "--limit", "0"])
+
+    assert "c.example" in limited.output
+    assert "a.example" not in limited.output
+    assert invalid.exit_code == 2
+
+
+def test_history_renders_markup_like_targets_literally(mock_http, db):
+    mock_http(lambda request: httpx.Response(200))
+    runner.invoke(
+        app, ["check", "https://e.co/[b]x[/b]", "--save"]
+    )
+
+    result = runner.invoke(app, ["history"])
+
+    assert result.exit_code == 0
+    assert "/[b]x[/b]" in result.output
+
+
+def test_compare_shows_resolved_and_new_findings(mock_http, db):
+    state = {"headers": {}}
+    mock_http(lambda request: httpx.Response(200, headers=state["headers"]))
+
+    runner.invoke(app, ["check", "https://example.com", "--save"])
+    state["headers"] = {
+        k: v for k, v in ALL_HEADERS.items() if k != "Referrer-Policy"
+    }
+    runner.invoke(app, ["check", "https://example.com", "--save"])
+
+    result = runner.invoke(app, ["compare", "1", "2"])
+
+    assert result.exit_code == 0
+    assert "TERATASI" in result.output
+    assert "Teratasi: 4" in result.output
+    assert "Tetap: 1" in result.output
+    assert "Baru: 0" in result.output
+    assert "Peringatan" not in result.output
+
+
+def test_compare_warns_when_targets_differ(mock_http, db):
+    mock_http(lambda request: httpx.Response(200))
+    runner.invoke(app, ["check", "https://a.example", "--save"])
+    runner.invoke(app, ["check", "https://b.example", "--save"])
+
+    result = runner.invoke(app, ["compare", "1", "2"])
+
+    assert result.exit_code == 0
+    assert "Peringatan" in result.output
+
+
+def test_compare_unknown_scan_id_exits_one(mock_http, db):
+    mock_http(lambda request: httpx.Response(200))
+    runner.invoke(app, ["check", "https://example.com", "--save"])
+
+    result = runner.invoke(app, ["compare", "1", "99"])
+
+    assert result.exit_code == 1
+    assert "99" in result.output
+
+
+@pytest.mark.parametrize("args", [["compare", "0", "1"], ["compare", "1"]])
+def test_compare_rejects_bad_arguments(db, args):
+    result = runner.invoke(app, args)
+
+    assert result.exit_code == 2
+
+
+def test_root_help_lists_history_commands():
+    result = runner.invoke(app, ["--help"])
+
+    assert "history" in result.output
+    assert "compare" in result.output
