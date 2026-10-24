@@ -1,7 +1,6 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -25,6 +24,7 @@ from sentrix.history import (
 )
 from sentrix.models import SEVERITY_ORDER, Finding
 from sentrix.normalize import normalize_findings
+from sentrix.reporting import ReportFormat, render_report
 from sentrix.rules import evaluate_headers
 
 app = typer.Typer(
@@ -142,7 +142,14 @@ def check(
         None,
         "--output",
         "-o",
-        help="Simpan laporan ke file JSON.",
+        help="Simpan laporan ke file (format default: JSON).",
+    ),
+    report_format: ReportFormat | None = typer.Option(
+        None,
+        "--format",
+        "-f",
+        case_sensitive=False,
+        help="Format file laporan: json, sarif, atau html. Perlu --output.",
     ),
     save: bool = typer.Option(
         False,
@@ -154,8 +161,15 @@ def check(
     """Inspect basic HTTP security headers for one URL."""
     validate_url(url)
 
+    # Fail before any network traffic rather than silently ignoring --format.
+    if report_format is not None and output is None:
+        raise typer.BadParameter(
+            "--format hanya berlaku bersama --output.",
+            param_hint="--format",
+        )
+
     console.print("\n[bold cyan]SENTRIX[/bold cyan] :: HTTP POSTURE CHECK")
-    console.print(f"[dim]Target: {url}[/dim]\n")
+    console.print(f"[dim]Target: {escape(url)}[/dim]\n")
 
     try:
         with httpx.Client(
@@ -167,7 +181,9 @@ def check(
             response = client.get(url)
 
     except httpx.HTTPError as exc:
-        console.print(f"[bold red]Request gagal:[/bold red] {exc}")
+        console.print(
+            f"[bold red]Request gagal:[/bold red] {escape(str(exc))}"
+        )
         raise typer.Exit(code=1) from exc
 
     finding_objects = evaluate_findings(
@@ -198,12 +214,20 @@ def check(
     console.print(f"\nFindings: {len(findings)}")
 
     if output is not None:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(
-            json.dumps(report, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
+        fmt = report_format or ReportFormat.JSON
+        try:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(render_report(report, fmt), encoding="utf-8")
+        except OSError as exc:
+            console.print(
+                "[bold red]Laporan gagal disimpan:[/bold red] "
+                f"{escape(str(exc))}"
+            )
+            raise typer.Exit(code=1) from exc
+        console.print(
+            f"[green]Laporan tersimpan:[/green] {escape(str(output))} "
+            f"[dim]({fmt.value})[/dim]"
         )
-        console.print(f"[green]Laporan tersimpan:[/green] {output}")
 
     if save:
         try:

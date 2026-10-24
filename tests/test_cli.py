@@ -468,3 +468,210 @@ def test_root_help_lists_history_commands():
 
     assert "history" in result.output
     assert "compare" in result.output
+
+
+# --- report exports: --format sarif / html ---------------------------------
+
+
+def test_format_sarif_writes_a_sarif_log(mock_http, tmp_path):
+    mock_http(lambda request: httpx.Response(200, headers={}))
+    path = tmp_path / "out" / "report.sarif"
+
+    result = runner.invoke(
+        app,
+        ["check", "https://example.com", "-o", str(path), "--format", "sarif"],
+    )
+
+    assert result.exit_code == 0
+    log = json.loads(path.read_text(encoding="utf-8"))
+    assert log["version"] == "2.1.0"
+    assert len(log["runs"][0]["results"]) == 5
+    assert "Laporan tersimpan" in result.output
+    assert "sarif" in result.output
+
+
+def test_format_html_writes_a_standalone_page(mock_http, tmp_path):
+    mock_http(lambda request: httpx.Response(200, headers={}))
+    path = tmp_path / "report.html"
+
+    result = runner.invoke(
+        app,
+        ["check", "https://example.com", "-o", str(path), "-f", "html"],
+    )
+
+    assert result.exit_code == 0
+    html = path.read_text(encoding="utf-8")
+    assert html.startswith("<!DOCTYPE html>")
+    assert "HTTP-001" in html
+    assert "<script" not in html
+
+
+def test_format_name_is_case_insensitive(mock_http, tmp_path):
+    mock_http(lambda request: httpx.Response(200))
+    path = tmp_path / "report.sarif"
+
+    result = runner.invoke(
+        app,
+        ["check", "https://example.com", "-o", str(path), "--format", "SARIF"],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == "2.1.0"
+
+
+def test_explicit_json_format_matches_the_default(mock_http, tmp_path):
+    mock_http(lambda request: httpx.Response(200, headers={}))
+    default_path = tmp_path / "default.json"
+    explicit_path = tmp_path / "explicit.json"
+
+    runner.invoke(app, ["check", "https://example.com", "-o", str(default_path)])
+    runner.invoke(
+        app,
+        ["check", "https://example.com", "-o", str(explicit_path), "-f", "json"],
+    )
+
+    default = json.loads(default_path.read_text(encoding="utf-8"))
+    explicit = json.loads(explicit_path.read_text(encoding="utf-8"))
+    default.pop("timestamp")
+    explicit.pop("timestamp")
+    assert default == explicit
+
+
+def test_format_without_output_is_rejected_before_any_request(mock_http):
+    seen = mock_http(lambda request: httpx.Response(200))
+
+    result = runner.invoke(
+        app, ["check", "https://example.com", "--format", "sarif"]
+    )
+
+    assert result.exit_code == 2
+    assert "--output" in result.output
+    assert seen == []
+
+
+def test_unknown_format_is_rejected_before_any_request(mock_http, tmp_path):
+    seen = mock_http(lambda request: httpx.Response(200))
+    path = tmp_path / "report.pdf"
+
+    result = runner.invoke(
+        app,
+        ["check", "https://example.com", "-o", str(path), "--format", "pdf"],
+    )
+
+    assert result.exit_code == 2
+    assert seen == []
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("fmt", ["sarif", "html"])
+def test_exports_do_not_contain_response_header_values(
+    mock_http, tmp_path, fmt
+):
+    mock_http(
+        lambda request: httpx.Response(
+            200,
+            headers={
+                "Set-Cookie": "session=TOP-SECRET-VALUE",
+                "Authorization": "Bearer TOP-SECRET-VALUE",
+            },
+        )
+    )
+    path = tmp_path / f"report.{fmt}"
+
+    result = runner.invoke(
+        app,
+        ["check", "https://example.com", "-o", str(path), "-f", fmt],
+    )
+
+    assert result.exit_code == 0
+    assert "TOP-SECRET-VALUE" not in path.read_text(encoding="utf-8")
+
+
+def test_html_export_drops_query_string_from_the_target(mock_http, tmp_path):
+    mock_http(lambda request: httpx.Response(200))
+    path = tmp_path / "report.html"
+
+    result = runner.invoke(
+        app,
+        [
+            "check",
+            "https://example.com/p?token=QUERY-SECRET",
+            "-o",
+            str(path),
+            "-f",
+            "html",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "QUERY-SECRET" not in path.read_text(encoding="utf-8")
+
+
+def test_export_can_be_combined_with_save(mock_http, db, tmp_path):
+    mock_http(lambda request: httpx.Response(200))
+    path = tmp_path / "report.sarif"
+
+    result = runner.invoke(
+        app,
+        [
+            "check",
+            "https://example.com",
+            "-o",
+            str(path),
+            "-f",
+            "sarif",
+            "--save",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert path.exists()
+    assert db.exists()
+    assert "#1" in result.output
+
+
+def test_unwritable_output_exits_one_without_a_traceback(mock_http, tmp_path):
+    mock_http(lambda request: httpx.Response(200))
+
+    # A directory cannot be opened for writing as a file.
+    result = runner.invoke(
+        app, ["check", "https://example.com", "-o", str(tmp_path)]
+    )
+
+    assert result.exit_code == 1
+    assert "Laporan gagal disimpan" in result.output
+    assert "Traceback" not in result.output
+    assert "Laporan tersimpan" not in result.output
+
+
+def test_markup_like_text_in_url_does_not_crash(mock_http):
+    mock_http(lambda request: httpx.Response(200))
+
+    result = runner.invoke(app, ["check", "https://example.com/[/dim]"])
+
+    assert result.exit_code == 0
+    assert "[/dim]" in result.output
+
+
+def test_markup_like_text_in_output_path_is_shown_literally(
+    mock_http, tmp_path, monkeypatch
+):
+    mock_http(lambda request: httpx.Response(200))
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app, ["check", "https://example.com", "-o", "[bold]r.json"]
+    )
+
+    assert result.exit_code == 0
+    assert "[bold]r.json" in result.output
+    assert (tmp_path / "[bold]r.json").exists()
+
+
+def test_check_help_lists_the_format_option():
+    result = runner.invoke(app, ["check", "--help"])
+
+    assert result.exit_code == 0
+    assert "--format" in result.output
+    assert "sarif" in result.output
+    assert "html" in result.output

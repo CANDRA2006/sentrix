@@ -40,6 +40,16 @@ class Confidence(StrEnum):
     LOW = "LOW"
 
 
+def compute_fingerprint(rule_id: str, evidence_type: str, header: str) -> str:
+    """Stable identity of an observation, from its rule and evidence only.
+
+    Shared by ``Finding.fingerprint`` and by exporters that work from the
+    already-serialized report, so both always agree.
+    """
+    raw = "|".join((rule_id, evidence_type, header))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
 @dataclass(frozen=True, slots=True)
 class Evidence:
     """What was observed. Never stores response header *values*."""
@@ -69,8 +79,9 @@ class Finding:
         changes to title/recommendation or severity re-triage do not make
         the same observation look like a new one.
         """
-        raw = "|".join((self.id, self.evidence.type, self.evidence.header))
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+        return compute_fingerprint(
+            self.id, self.evidence.type, self.evidence.header
+        )
 
     def to_dict(self) -> dict:
         """JSON-serializable form; key order is part of the report format."""
