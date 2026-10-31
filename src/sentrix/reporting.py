@@ -18,6 +18,11 @@ Design notes:
   warning, LOW/INFO -> note). The original label is kept in each result's
   ``properties``. ``security-severity`` is deliberately not set, because
   SENTRIX severities are not CVSS scores.
+* The rule policy the scan ran under (disabled rules, severity overrides) is
+  part of the report, so it is shown in the HTML page and carried in the
+  SARIF run properties. A reader must be able to tell "no finding" from
+  "rule not evaluated". Reports written before policies existed have no
+  ``policy`` block and are rendered without one.
 """
 
 from __future__ import annotations
@@ -126,6 +131,22 @@ def build_sarif(report: dict) -> dict:
     if end_time is not None:
         invocation["endTimeUtc"] = end_time
 
+    run_properties: dict = {
+        "requestedUrl": sanitize_url(report["target"]["requested_url"]),
+        "finalUrl": final_url,
+        "httpStatusCode": report["http"]["status_code"],
+        "redirectCount": report["http"]["redirect_count"],
+        "limitations": list(report["limitations"]),
+    }
+    policy = report.get("policy")
+    if policy is not None:
+        run_properties["policy"] = {
+            "source": policy["source"],
+            "failOn": policy["fail_on"],
+            "disabledRules": list(policy["disabled_rules"]),
+            "severityOverrides": dict(policy["severity_overrides"]),
+        }
+
     return {
         "$schema": SARIF_SCHEMA_URI,
         "version": SARIF_VERSION,
@@ -140,15 +161,7 @@ def build_sarif(report: dict) -> dict:
                 },
                 "invocations": [invocation],
                 "results": results,
-                "properties": {
-                    "requestedUrl": sanitize_url(
-                        report["target"]["requested_url"]
-                    ),
-                    "finalUrl": final_url,
-                    "httpStatusCode": report["http"]["status_code"],
-                    "redirectCount": report["http"]["redirect_count"],
-                    "limitations": list(report["limitations"]),
-                },
+                "properties": run_properties,
             }
         ],
     }
@@ -201,7 +214,8 @@ table { width: 100%; min-width: 56rem; border-collapse: collapse; font-size: .92
 td:first-child code { white-space: nowrap; }
 th, td { text-align: left; vertical-align: top; padding: .55rem .6rem; border-bottom: 1px solid var(--line); }
 th { color: var(--muted); font-weight: 600; white-space: nowrap; }
-.empty { margin: .75rem 0 0; }
+.empty, .note { margin: .75rem 0 0; }
+.note { color: var(--muted); font-size: .9rem; }
 footer { margin-top: 2rem; color: var(--muted); font-size: .85rem; }
 @media (max-width: 30rem) {
   dl { grid-template-columns: 1fr; gap: 0; }
@@ -232,6 +246,58 @@ def _summary_items(summary: dict) -> str:
     ]
     items.append(f"<li>Total <strong>{_e(summary['findings'])}</strong></li>")
     return "\n".join(items)
+
+
+def _policy_section(policy: dict | None) -> str:
+    """The rule policy the scan ran under; empty for pre-policy reports."""
+    if policy is None:
+        return ""
+
+    disabled = policy["disabled_rules"]
+    overrides = policy["severity_overrides"]
+    fail_on = policy["fail_on"]
+
+    source = (
+        _e(policy["source"])
+        if policy["source"]
+        else "Bawaan (tanpa file konfigurasi)"
+    )
+    disabled_html = (
+        ", ".join(f"<code>{_e(rule_id)}</code>" for rule_id in disabled)
+        or "Tidak ada"
+    )
+    overrides_html = (
+        ", ".join(
+            f"<code>{_e(rule_id)}</code> &rarr; {_badge(severity)}"
+            for rule_id, severity in overrides.items()
+        )
+        or "Tidak ada"
+    )
+    gate_html = (
+        f"Severity {_badge(fail_on)} atau lebih tinggi"
+        if fail_on
+        else "Tidak diatur"
+    )
+    note = (
+        '<p class="note">Aturan yang dinonaktifkan tidak dievaluasi, jadi '
+        "tidak adanya temuan untuk aturan tersebut bukan bukti bahwa "
+        "targetnya aman dari hal itu.</p>\n"
+        if disabled
+        else ""
+    )
+
+    return (
+        '<section aria-labelledby="h-policy">\n'
+        '<h2 id="h-policy">Kebijakan</h2>\n'
+        "<dl>\n"
+        f"<dt>Sumber</dt><dd>{source}</dd>\n"
+        f"<dt>Aturan nonaktif</dt><dd>{disabled_html}</dd>\n"
+        f"<dt>Override severity</dt><dd>{overrides_html}</dd>\n"
+        f"<dt>Gagal jika</dt><dd>{gate_html}</dd>\n"
+        "</dl>\n"
+        f"{note}"
+        "</section>\n"
+    )
 
 
 def _findings_section(findings: list[dict]) -> str:
@@ -305,7 +371,7 @@ def render_html(report: dict) -> str:
 <dt>Redirect</dt><dd>{_e(http['redirect_count'])}</dd>
 </dl>
 </section>
-<section aria-labelledby="h-summary">
+{_policy_section(report.get('policy'))}<section aria-labelledby="h-summary">
 <h2 id="h-summary">Ringkasan</h2>
 <ul class="summary">
 {_summary_items(report['summary'])}

@@ -8,6 +8,8 @@ import httpx
 import pytest
 
 from sentrix import cli
+from sentrix.models import Severity
+from sentrix.policy import Policy, apply_policy
 from sentrix.reporting import (
     SARIF_FINGERPRINT_KEY,
     ReportFormat,
@@ -17,26 +19,44 @@ from sentrix.reporting import (
     render_report,
     render_sarif,
 )
+from sentrix.rules import RULES
 
 URL = "https://example.com/app"
 
 
 def make_report(
-    headers: dict[str, str] | None = None, url: str = URL
+    headers: dict[str, str] | None = None,
+    url: str = URL,
+    policy: Policy | None = None,
 ) -> dict:
     """A real report, built the same way ``sentrix check`` builds it."""
     response = httpx.Response(
         200, headers=headers or {}, request=httpx.Request("GET", url)
     )
     findings = cli.analyze_headers(
-        response.headers, is_https=response.url.scheme == "https"
+        response.headers,
+        is_https=response.url.scheme == "https",
+        rules=apply_policy(RULES, policy or Policy()),
     )
-    return cli.build_report(url, response, findings)
+    return cli.build_report(url, response, findings, policy)
 
 
 @pytest.fixture
 def report() -> dict:
     return make_report()
+
+
+POLICY = Policy(
+    source="sentrix.toml",
+    fail_on=Severity.MEDIUM,
+    disabled_rules=("HTTP-005",),
+    severity_overrides={"HTTP-001": Severity.HIGH},
+)
+
+
+@pytest.fixture
+def policy_report() -> dict:
+    return make_report(policy=POLICY)
 
 
 @pytest.fixture
@@ -422,3 +442,105 @@ def test_render_report_rejects_unknown_format(report):
 
 def test_report_format_values_are_the_cli_spellings():
     assert [fmt.value for fmt in ReportFormat] == ["json", "sarif", "html"]
+
+
+# --- rule policy in the exports --------------------------------------------
+
+
+def test_sarif_run_carries_the_policy(policy_report):
+    props = build_sarif(policy_report)["runs"][0]["properties"]
+
+    assert props["policy"] == {
+        "source": "sentrix.toml",
+        "failOn": "MEDIUM",
+        "disabledRules": ["HTTP-005"],
+        "severityOverrides": {"HTTP-001": "HIGH"},
+    }
+
+
+def test_sarif_reflects_the_policy_in_levels_and_rules(policy_report):
+    run = build_sarif(policy_report)["runs"][0]
+    by_rule = {result["ruleId"]: result for result in run["results"]}
+
+    assert "HTTP-005" not in by_rule  # disabled: never evaluated
+    assert by_rule["HTTP-001"]["level"] == "error"  # overridden to HIGH
+    assert by_rule["HTTP-001"]["properties"]["severity"] == "HIGH"
+
+
+def test_sarif_without_a_policy_block_still_renders(report):
+    del report["policy"]
+
+    props = build_sarif(report)["runs"][0]["properties"]
+
+    assert "policy" not in props
+
+
+def test_html_shows_the_policy(policy_report):
+    html = render_html(policy_report)
+
+    assert "Kebijakan" in html
+    assert "sentrix.toml" in html
+    assert "<code>HTTP-005</code>" in html
+    assert "<code>HTTP-001</code> &rarr;" in html
+    assert "Severity" in html and "atau lebih tinggi" in html
+
+
+def test_html_warns_that_disabled_rules_are_not_evidence_of_safety(
+    policy_report,
+):
+    assert "bukan bukti" in render_html(policy_report)
+
+
+def test_html_default_policy_says_so_and_has_no_warning(report):
+    html = render_html(report)
+
+    assert "Bawaan (tanpa file konfigurasi)" in html
+    assert "Tidak ada" in html
+    assert "Tidak diatur" in html
+    assert "Aturan yang dinonaktifkan tidak dievaluasi" not in html
+
+
+def test_html_without_a_policy_block_still_renders(report):
+    del report["policy"]
+
+    html = render_html(report)
+
+    assert "Kebijakan" not in html
+    assert audit(html).errors == []
+
+
+def test_html_escapes_every_policy_value(report):
+    payload = "<script>alert(1)</script>"
+    attr_payload = '"><img src=x onerror=alert(1)>'
+    report["policy"] = {
+        "source": payload,
+        "fail_on": attr_payload,
+        "disabled_rules": [payload, attr_payload],
+        "severity_overrides": {payload: attr_payload, attr_payload: payload},
+    }
+
+    html = render_html(report)
+    parsed = audit(html)
+
+    assert "<script" not in html
+    assert "<img" not in html
+    assert not {"script", "img"} & set(parsed.seen)
+    assert not any(name.startswith("on") for name, _ in parsed.attrs)
+    assert parsed.errors == []
+    assert "sev-unknown" in html  # unknown severities fall back safely
+
+
+def test_html_with_policy_is_still_well_formed_and_self_contained(
+    policy_report,
+):
+    parsed = audit(render_html(policy_report))
+
+    assert parsed.errors == [] and parsed.stack == []
+    assert not FORBIDDEN_TAGS & set(parsed.seen)
+
+
+@pytest.mark.parametrize("fmt", list(ReportFormat))
+def test_policy_reports_render_deterministically(policy_report, fmt):
+    assert render_report(policy_report, fmt) == render_report(
+        policy_report, fmt
+    )

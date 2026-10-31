@@ -27,12 +27,20 @@ sentrix check https://example.com --output reports/example.json
 sentrix check https://example.com -o reports/example.sarif --format sarif
 sentrix check https://example.com -o reports/example.html --format html
 sentrix check https://example.com --save
+sentrix check https://example.com --config sentrix.toml --fail-on MEDIUM
+sentrix rules --config sentrix.toml
 sentrix history
 sentrix compare 1 2
 ```
 
-`check` is a required subcommand. Invalid input exits with code 2; network
-failures, timeouts, and redirect loops exit with code 1.
+`check` is a required subcommand. Exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | The scan ran. Findings do not change this unless `--fail-on` is used. |
+| `1` | The scan could not complete: network failure, timeout, redirect loop, or a report or history file that could not be written. |
+| `2` | Invalid input: bad URL, unknown option value, or an invalid policy file. |
+| `3` | The `--fail-on` gate failed: a finding is at or above the threshold. |
 
 ## Report formats
 
@@ -63,6 +71,64 @@ All three are rendered from the same report, so they always agree.
   fragment removed. The JSON report keeps the URL exactly as you typed it, as
   before, so avoid sharing it if the query string carries a token.
 - None of the formats contain response header values.
+- The rule policy a scan ran under (see below) is part of every report: the
+  JSON `policy` block (report schema `1.1`), a "Kebijakan" section in the
+  HTML page, and `policy` in the SARIF run properties.
+
+## Rule policy
+
+A policy file changes which built-in rules run, how severe they are, and when
+`check` fails. It is a small TOML file, and it is only read when you ask for
+it:
+
+```toml
+# sentrix.toml
+[policy]
+fail_on = "MEDIUM"   # exit code 3 if any finding is MEDIUM or higher
+
+[rules.HTTP-001]
+severity = "HIGH"    # re-triage a rule: HIGH, MEDIUM, LOW, or INFO
+
+[rules.HTTP-005]
+enabled = false      # do not evaluate this rule at all
+```
+
+```bash
+sentrix rules                                  # list rule ids, headers, severities
+sentrix rules --config sentrix.toml            # same, with the policy applied
+sentrix check https://example.com --config sentrix.toml
+sentrix check https://example.com --fail-on HIGH   # gate without a file
+```
+
+| Setting | Effect |
+|---|---|
+| `[policy] fail_on` | `check` exits with code `3` if any finding is at or above this severity. `--fail-on` on the command line overrides it. Without either, findings never change the exit code. |
+| `[rules.ID] enabled = false` | The rule is not evaluated. |
+| `[rules.ID] severity` | Replaces the rule's severity. The finding keeps its fingerprint, so `compare` shows a severity change, not a new finding. |
+
+How it behaves:
+
+- **Explicit only.** Pass `--config PATH` (or `-c`), or set `SENTRIX_CONFIG`;
+  the flag wins. A `sentrix.toml` in the current directory is never picked up
+  on its own, so a stray file cannot change a result.
+- **Strict.** Unknown keys, unknown rule ids, wrong types, and invalid
+  severities are errors (exit code `2`, before any request), because a typo
+  that is silently ignored looks exactly like a policy that works.
+  `sentrix rules --config FILE` checks a file without scanning anything. Use
+  `sentrix rules` to see the valid rule ids.
+- **Suppression is never silent.** `check` prints the active policy, and
+  disabled rules and severity overrides are recorded in the report and in the
+  history. Treat a disabled rule as "not evaluated", not as "passed". If a
+  policy disables every rule, `check` warns that nothing was checked and the
+  gate message says so instead of reporting a plain pass.
+- **The gate runs last.** When `--fail-on` fails, the report and the history
+  entry are still written first, so a failed CI run keeps its evidence.
+- **Only the file name is recorded**, not its directory.
+- **Limits.** UTF-8 only (a BOM is fine), at most 64 KiB, and no absurdly
+  deep nesting (reported as an invalid file). Policies cannot add rules or run
+  code. In Windows PowerShell 5, `>` writes UTF-16, which is
+  rejected; create the file in an editor that saves UTF-8, or write it with
+  `Set-Content -Encoding utf8`.
 
 ## Scan history
 
@@ -78,21 +144,35 @@ sentrix compare 1 2                        # old id, then new id
 `compare OLD NEW` matches findings by fingerprint (rule id + evidence, so
 re-wording a title does not make a finding look new) and reports findings
 that are new, resolved, unchanged, or changed severity. Comparing scans of
-different targets prints a warning. `compare` is directional: swapping the
-ids swaps "new" and "resolved".
+different targets prints a warning, and so does comparing scans that ran
+under different rule policies, because a rule that was switched off looks
+"resolved" without the target having changed. `--fail-on` is not part of that
+comparison, since it cannot change what a scan finds. `compare` is
+directional: swapping the ids swaps "new" and "resolved".
 
 The database defaults to `~/.sentrix/history.db`. Override it with
 `--db PATH` or the `SENTRIX_DB` environment variable. A new database file is
 created owner-only (`0600`) inside a `0700` directory on POSIX systems.
 
 What is stored: target and final URL, timestamp, HTTP status, tool version,
-and the findings (rule id, title, severity, confidence, header name). What is
-**not** stored: response header values, and URL userinfo, query string, and
-fragment. URL paths are stored as-is, so avoid scanning URLs whose path
-itself carries a secret.
+the rule policy the scan ran under (disabled rules and severity overrides,
+not the file path), and the findings (rule id, title, severity, confidence,
+header name). What is **not** stored: response header values, and URL
+userinfo, query string, and fragment. URL paths are stored as-is, so avoid
+scanning URLs whose path itself carries a secret.
 
-A database written by a newer SENTRIX schema is refused rather than
-modified, and a SQLite file that is not a SENTRIX history is never adopted.
+The history schema is versioned. A database from an older SENTRIX is upgraded
+in place the first time it is opened (schema 1 to 2 adds the policy column;
+existing scans keep their data and count as "default rules"), inside a single
+transaction, so a failed upgrade leaves the file as it was. That first open
+needs write access even for read-only commands such as `history` and
+`compare`, so an old database on a read-only mount must be made writable once.
+After the upgrade, older SENTRIX versions refuse the file rather than modify
+it, and so does any database written by a newer schema. A SQLite file that is
+not a SENTRIX history is never adopted: its tables are checked before an
+upgrade, and a file that does not match is left untouched. Back up
+`~/.sentrix/history.db` first if you want to keep the option of going back to
+an older version.
 
 ## Testing
 

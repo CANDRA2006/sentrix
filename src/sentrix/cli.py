@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -22,10 +23,19 @@ from sentrix.history import (
     open_history,
     save_scan,
 )
-from sentrix.models import SEVERITY_ORDER, Finding
+from sentrix.models import SEVERITY_ORDER, Finding, Severity
 from sentrix.normalize import normalize_findings
+from sentrix.policy import (
+    CONFIG_ENV_VAR,
+    Policy,
+    PolicyError,
+    apply_policy,
+    describe_rule_policy,
+    gate_failed,
+    load_policy,
+)
 from sentrix.reporting import ReportFormat, render_report
-from sentrix.rules import evaluate_headers
+from sentrix.rules import RULES, Rule, evaluate_headers
 
 app = typer.Typer(
     name="sentrix",
@@ -36,9 +46,11 @@ console = Console()
 
 TOOL_NAME = "SENTRIX"
 TOOL_VERSION = "0.1.0"
-REPORT_SCHEMA_VERSION = "1.0"
+# 1.1 adds the "policy" block (additive; every 1.0 key is unchanged).
+REPORT_SCHEMA_VERSION = "1.1"
 REQUEST_TIMEOUT_SECONDS = 8.0
 MAX_REDIRECTS = 5
+EXIT_GATE_FAILED = 3
 LIMITATIONS = [
     "Checks response headers only.",
     "Missing headers are observations, not proof of exploitation.",
@@ -74,16 +86,23 @@ def validate_url(url: str) -> str:
 
 
 def evaluate_findings(
-    headers: httpx.Headers, is_https: bool
+    headers: httpx.Headers,
+    is_https: bool,
+    rules: tuple[Rule, ...] = RULES,
 ) -> list[Finding]:
     """Run the header rules and return normalized Finding objects."""
-    return normalize_findings(evaluate_headers(headers, is_https))
+    return normalize_findings(evaluate_headers(headers, is_https, rules))
 
 
-def analyze_headers(headers: httpx.Headers, is_https: bool) -> list[dict]:
+def analyze_headers(
+    headers: httpx.Headers,
+    is_https: bool,
+    rules: tuple[Rule, ...] = RULES,
+) -> list[dict]:
     """Generate normalized findings as report-ready dicts."""
     return [
-        finding.to_dict() for finding in evaluate_findings(headers, is_https)
+        finding.to_dict()
+        for finding in evaluate_findings(headers, is_https, rules)
     ]
 
 
@@ -94,11 +113,44 @@ DbOption = typer.Option(
     help="Path database riwayat SQLite (default: ~/.sentrix/history.db).",
 )
 
+ConfigOption = typer.Option(
+    None,
+    "--config",
+    "-c",
+    envvar=CONFIG_ENV_VAR,
+    help="File kebijakan TOML: nonaktifkan aturan, ubah severity, fail_on.",
+)
+
+
+def load_effective_policy(
+    config: Path | None, fail_on: Severity | None
+) -> Policy:
+    """Load the policy file (if any); ``--fail-on`` overrides the file.
+
+    An invalid file ends the command with exit code 2, like other invalid
+    input, before anything touches the network.
+    """
+    policy = Policy()
+    if config is not None:
+        try:
+            policy = load_policy(config)
+        except PolicyError as exc:
+            console.print(
+                "[bold red]Konfigurasi tidak valid[/bold red] "
+                f"({escape(str(config))}): {escape(str(exc))}"
+            )
+            raise typer.Exit(code=2) from exc
+
+    if fail_on is not None:
+        policy = replace(policy, fail_on=fail_on)
+    return policy
+
 
 def build_report(
     requested_url: str,
     response: httpx.Response,
     findings: list[dict],
+    policy: Policy | None = None,
 ) -> dict:
     """Build the JSON-serializable report without leaking header values."""
     return {
@@ -117,6 +169,7 @@ def build_report(
             "final_scheme": response.url.scheme,
             "redirect_count": len(response.history),
         },
+        "policy": (policy or Policy()).to_report_dict(),
         "summary": {
             "findings": len(findings),
             "by_severity": {
@@ -157,6 +210,16 @@ def check(
         help="Simpan hasil scan ke riwayat lokal (SQLite).",
     ),
     db: Path | None = DbOption,
+    config: Path | None = ConfigOption,
+    fail_on: Severity | None = typer.Option(
+        None,
+        "--fail-on",
+        case_sensitive=False,
+        help=(
+            "Keluar dengan kode 3 jika ada temuan pada severity ini atau "
+            "lebih tinggi. Menimpa fail_on di file konfigurasi."
+        ),
+    ),
 ) -> None:
     """Inspect basic HTTP security headers for one URL."""
     validate_url(url)
@@ -168,8 +231,20 @@ def check(
             param_hint="--format",
         )
 
+    policy = load_effective_policy(config, fail_on)
+    active_rules = apply_policy(RULES, policy)
+
     console.print("\n[bold cyan]SENTRIX[/bold cyan] :: HTTP POSTURE CHECK")
-    console.print(f"[dim]Target: {escape(url)}[/dim]\n")
+    console.print(f"[dim]Target: {escape(url)}[/dim]")
+    if not policy.is_default:
+        # Switched-off rules are a suppression, so they are always shown.
+        console.print(f"[dim]Kebijakan: {escape(policy.summary())}[/dim]")
+    if not active_rules:
+        console.print(
+            "[yellow]Peringatan:[/yellow] semua aturan dinonaktifkan, "
+            "jadi tidak ada pemeriksaan yang dijalankan."
+        )
+    console.print()
 
     try:
         with httpx.Client(
@@ -189,10 +264,11 @@ def check(
     finding_objects = evaluate_findings(
         response.headers,
         is_https=response.url.scheme == "https",
+        rules=active_rules,
     )
     findings = [finding.to_dict() for finding in finding_objects]
 
-    report = build_report(url, response, findings)
+    report = build_report(url, response, findings, policy)
 
     table = Table(title="HTTP Security Posture")
     table.add_column("Rule ID")
@@ -240,6 +316,7 @@ def check(
                     status_code=response.status_code,
                     tool_version=TOOL_VERSION,
                     findings=finding_objects,
+                    policy=policy.rule_policy_json(),
                 )
         except HistoryError as exc:
             console.print(
@@ -248,6 +325,56 @@ def check(
             raise typer.Exit(code=1) from exc
 
         console.print(f"[green]Scan tersimpan di riwayat:[/green] #{scan_id}")
+
+    # Last on purpose: the report and the history entry are written even
+    # when the gate fails, so a failed CI run still leaves its evidence.
+    if policy.fail_on is not None:
+        threshold = policy.fail_on.value
+        if gate_failed(finding_objects, policy.fail_on):
+            console.print(
+                f"[bold red]Gate gagal:[/bold red] ada temuan dengan "
+                f"severity {threshold} atau lebih tinggi."
+            )
+            raise typer.Exit(code=EXIT_GATE_FAILED)
+        note = "" if active_rules else " (tanpa pemeriksaan: semua aturan nonaktif)"
+        console.print(
+            f"[green]Gate lulus:[/green] tidak ada temuan dengan "
+            f"severity {threshold} atau lebih tinggi.{note}"
+        )
+
+
+@app.command("rules")
+def rules_command(config: Path | None = ConfigOption) -> None:
+    """List the built-in rules and what the policy does to each of them.
+
+    Works offline, so it also checks a policy file without scanning anything.
+    """
+    policy = load_effective_policy(config, None)
+    if not policy.is_default:
+        console.print(f"[dim]Kebijakan: {escape(policy.summary())}[/dim]")
+
+    table = Table(title="Rules")
+    table.add_column("Rule ID")
+    table.add_column("Header")
+    table.add_column("Severity")
+    table.add_column("Status")
+
+    for rule in RULES:
+        override = policy.severity_overrides.get(rule.id)
+        severity = rule.severity.value
+        if override is not None:
+            severity = f"{override.value} (bawaan: {rule.severity.value})"
+
+        if rule.id in policy.disabled_rules:
+            status = "nonaktif"
+        elif rule.https_only:
+            status = "aktif (hanya HTTPS)"
+        else:
+            status = "aktif"
+
+        table.add_row(rule.id, rule.header, severity, status)
+
+    console.print(table)
 
 
 @app.command("history")
@@ -321,6 +448,17 @@ def _print_diff(diff: ScanDiff) -> None:
         console.print(
             "[yellow]Peringatan:[/yellow] kedua scan memiliki target yang "
             "berbeda; hasil perbandingan mungkin tidak bermakna.\n"
+        )
+
+    if not diff.same_policy:
+        console.print(
+            "[yellow]Peringatan:[/yellow] kedua scan memakai kebijakan "
+            "aturan yang berbeda "
+            f"(lama: {escape(describe_rule_policy(diff.old.policy))}; "
+            f"baru: {escape(describe_rule_policy(diff.new.policy))}). "
+            "Temuan BARU, TERATASI, atau BERUBAH bisa jadi hanya akibat "
+            "aturan yang dinonaktifkan atau diubah severity-nya, bukan "
+            "karena targetnya berubah.\n"
         )
 
     _finding_lines("BARU     ", "red", list(diff.appeared))
