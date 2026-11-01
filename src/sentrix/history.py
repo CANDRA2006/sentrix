@@ -7,6 +7,11 @@ Design notes:
   string, or fragment, since those parts commonly carry secrets.
 * Findings are matched across scans by ``Finding.fingerprint``, which is
   independent of wording and severity.
+* Each scan also stores the rule policy it ran under (``None`` for the
+  default rules). A rule that was switched off produces no finding, so
+  without this ``compare`` would report it as "resolved".
+* The schema is versioned with ``PRAGMA user_version``. Older databases are
+  migrated in place, inside one transaction; newer ones are refused.
 """
 
 from __future__ import annotations
@@ -21,7 +26,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from sentrix.models import Finding, Severity
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DB_ENV_VAR = "SENTRIX_DB"
 
 _SCHEMA_STATEMENTS = (
@@ -32,7 +37,8 @@ _SCHEMA_STATEMENTS = (
         final_url     TEXT    NOT NULL,
         scanned_at    TEXT    NOT NULL,
         status_code   INTEGER NOT NULL,
-        tool_version  TEXT    NOT NULL
+        tool_version  TEXT    NOT NULL,
+        policy        TEXT
     )
     """,
     """
@@ -51,6 +57,30 @@ _SCHEMA_STATEMENTS = (
     f"PRAGMA user_version = {SCHEMA_VERSION}",
 )
 
+# Statements that upgrade a database *from* the given version by one step.
+# Version 1 -> 2: scans remember the rule policy they ran under. The new
+# column is nullable, and NULL means "default rules", which is exactly what
+# every scan stored before policies existed ran with.
+_MIGRATIONS: dict[int, tuple[str, ...]] = {
+    1: ("ALTER TABLE scans ADD COLUMN policy TEXT",),
+}
+
+# Columns each table must have before a migration *from* that version is
+# allowed to touch the file. ``user_version`` alone is not proof that a file
+# is a SENTRIX history: any SQLite database can carry the number 1.
+_EXPECTED_COLUMNS: dict[int, dict[str, frozenset[str]]] = {
+    1: {
+        "scans": frozenset(
+            {"id", "target", "final_url", "scanned_at", "status_code",
+             "tool_version"}
+        ),
+        "scan_findings": frozenset(
+            {"scan_id", "fingerprint", "rule_id", "title", "severity",
+             "confidence", "header"}
+        ),
+    },
+}
+
 
 class HistoryError(Exception):
     """Raised for user-facing history problems (bad id, unusable database)."""
@@ -65,6 +95,7 @@ class ScanRecord:
     status_code: int
     tool_version: str
     finding_count: int
+    policy: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +128,11 @@ class ScanDiff:
     @property
     def same_target(self) -> bool:
         return self.old.target == self.new.target
+
+    @property
+    def same_policy(self) -> bool:
+        """False if the scans ran with different rules or severities."""
+        return self.old.policy == self.new.policy
 
 
 def default_db_path() -> Path:
@@ -169,6 +205,13 @@ def _user_version(conn: sqlite3.Connection) -> int:
     return conn.execute("PRAGMA user_version").fetchone()[0]
 
 
+def _newer_schema_error(version: int) -> HistoryError:
+    return HistoryError(
+        "Database riwayat dibuat oleh versi SENTRIX yang lebih baru "
+        f"(schema {version}, didukung {SCHEMA_VERSION})."
+    )
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     version = _user_version(conn)
 
@@ -176,35 +219,74 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         return
 
     if version > SCHEMA_VERSION:
-        raise HistoryError(
-            "Database riwayat dibuat oleh versi SENTRIX yang lebih baru "
-            f"(schema {version}, didukung {SCHEMA_VERSION})."
-        )
+        raise _newer_schema_error(version)
 
-    # Fresh database. Take the write lock first and re-check, so two SENTRIX
-    # processes starting at the same time cannot both try to create tables.
+    # Fresh or older database. Take the write lock first and re-check, so two
+    # SENTRIX processes starting at the same time cannot both create tables
+    # or both try to migrate. DDL and ``user_version`` are transactional in
+    # SQLite, so a failure anywhere below leaves the file exactly as it was.
     conn.execute("BEGIN IMMEDIATE")
     try:
         version = _user_version(conn)
         if version == SCHEMA_VERSION:  # another process won the race
             conn.rollback()
             return
+        if version > SCHEMA_VERSION:
+            raise _newer_schema_error(version)
 
-        existing = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1"
-        ).fetchone()
-        if existing is not None:
-            raise HistoryError(
-                "File database sudah berisi tabel lain dan bukan riwayat "
-                "SENTRIX; gunakan path lain."
-            )
-
-        for statement in _SCHEMA_STATEMENTS:
-            conn.execute(statement)
+        if version == 0:
+            _create_schema(conn)
+        else:
+            _migrate(conn, version)
         conn.commit()
     except BaseException:
         conn.rollback()
         raise
+
+
+def _create_schema(conn: sqlite3.Connection) -> None:
+    existing = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1"
+    ).fetchone()
+    if existing is not None:
+        raise HistoryError(
+            "File database sudah berisi tabel lain dan bukan riwayat "
+            "SENTRIX; gunakan path lain."
+        )
+
+    for statement in _SCHEMA_STATEMENTS:
+        conn.execute(statement)
+
+
+def _check_shape(conn: sqlite3.Connection, version: int) -> None:
+    """Refuse to migrate a file whose tables are not SENTRIX's."""
+    expected = _EXPECTED_COLUMNS.get(version)
+    if expected is None:
+        return
+    for table, columns in expected.items():
+        # ``table`` comes from the constant above, never from user input.
+        found = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if found != columns:
+            raise HistoryError(
+                f"File database bertanda schema {version} tetapi tabel "
+                f"'{table}' bukan milik riwayat SENTRIX; file tidak diubah. "
+                "Gunakan path lain."
+            )
+
+
+def _migrate(conn: sqlite3.Connection, version: int) -> None:
+    _check_shape(conn, version)
+    while version < SCHEMA_VERSION:
+        statements = _MIGRATIONS.get(version)
+        if statements is None:
+            raise HistoryError(
+                f"Versi schema database riwayat tidak dikenali ({version})."
+            )
+        for statement in statements:
+            conn.execute(statement)
+        version += 1
+    # PRAGMA does not accept bound parameters; SCHEMA_VERSION is a constant.
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 def save_scan(
@@ -216,18 +298,24 @@ def save_scan(
     status_code: int,
     tool_version: str,
     findings: Sequence[Finding],
+    policy: str | None = None,
 ) -> int:
-    """Store one scan and its findings; return the new scan id."""
+    """Store one scan and its findings; return the new scan id.
+
+    ``policy`` is ``Policy.rule_policy_json()``: ``None`` means the scan ran
+    with the default rules.
+    """
     cursor = conn.execute(
         "INSERT INTO scans "
-        "(target, final_url, scanned_at, status_code, tool_version) "
-        "VALUES (?, ?, ?, ?, ?)",
+        "(target, final_url, scanned_at, status_code, tool_version, policy) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
         (
             sanitize_url(target),
             sanitize_url(final_url),
             scanned_at,
             status_code,
             tool_version,
+            policy,
         ),
     )
     scan_id = cursor.lastrowid
@@ -255,7 +343,7 @@ def save_scan(
 
 _SCAN_SELECT = """
 SELECT s.id, s.target, s.final_url, s.scanned_at, s.status_code,
-       s.tool_version, COUNT(f.fingerprint) AS finding_count
+       s.tool_version, s.policy, COUNT(f.fingerprint) AS finding_count
 FROM scans AS s
 LEFT JOIN scan_findings AS f ON f.scan_id = s.id
 """
@@ -270,6 +358,7 @@ def _record(row: sqlite3.Row) -> ScanRecord:
         status_code=row["status_code"],
         tool_version=row["tool_version"],
         finding_count=row["finding_count"],
+        policy=row["policy"],
     )
 
 
