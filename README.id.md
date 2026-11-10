@@ -26,6 +26,12 @@ deployment, dan threat model-nya, dan SENTRIX melaporkannya dengan cara itu.
   Content-Security-Policy, Strict-Transport-Security, X-Content-Type-Options,
   Referrer-Policy, dan Permissions-Policy. Header yang tidak ada atau kosong
   dihitung sebagai temuan.
+- **Pemeriksaan nilai header.** Enam aturan tambahan menilai header yang sudah
+  ada: `max-age` HSTS yang lemah, CSP yang mengizinkan script inline/eval atau
+  dari origin mana pun, nilai `nosniff` yang salah, Referrer-Policy yang
+  membocorkan URL lengkap, serta pembocoran versi atau teknologi pada `Server`
+  dan `X-Powered-By`. Nilai header hanya diperiksa, tidak pernah disimpan di
+  temuan, laporan, maupun riwayat.
 - **Temuan berbasis bukti.** Setiap temuan membawa rule id, bukti
   pendukungnya, label confidence, saran perbaikan, dan fingerprint yang stabil.
   Temuan di-deduplikasi dan diurutkan secara deterministik.
@@ -74,7 +80,9 @@ python -m pip install -e ".[dev]"
 
 ```bash
 sentrix --help
+sentrix --version
 sentrix check https://example.com
+sentrix check https://example.com --timeout 15 --max-redirects 3
 sentrix check https://example.com --output reports/example.json
 sentrix check https://example.com -o reports/example.sarif --format sarif
 sentrix check https://example.com -o reports/example.html --format html
@@ -130,6 +138,19 @@ JSON berbahasa Inggris.
 | `HTTP-003` | `X-Content-Type-Options` | LOW | Membantu mencegah MIME-type sniffing. |
 | `HTTP-004` | `Referrer-Policy` | LOW | Mengatur informasi referrer yang dikirim browser. |
 | `HTTP-005` | `Permissions-Policy` | INFO | Mengatur kemampuan browser tertentu. |
+| `HTTP-101` | `Strict-Transport-Security` | LOW | Ada, tetapi `max-age` hilang, nol, atau kurang dari 180 hari. Hanya dievaluasi untuk respons HTTPS. |
+| `HTTP-102` | `Content-Security-Policy` | MEDIUM | Kebijakan script efektif (`script-src`, atau `default-src`) mengizinkan `'unsafe-inline'` tanpa nonce/hash, `'unsafe-eval'`, `*`, `http:`, `https:`, atau `data:`. Bersifat heuristik, sehingga confidence-nya MEDIUM. |
+| `HTTP-103` | `X-Content-Type-Options` | LOW | Ada, tetapi nilainya bukan `nosniff`. |
+| `HTTP-104` | `Referrer-Policy` | LOW | Kebijakan efektif (yang terakhir) adalah `unsafe-url` atau `no-referrer-when-downgrade`. |
+| `HTTP-201` | `Server` | LOW | Nilainya memuat nomor versi. |
+| `HTTP-202` | `X-Powered-By` | LOW | Header ini ada. |
+
+Aturan `HTTP-001` sampai `HTTP-005` melaporkan header yang hilang. Aturan
+`HTTP-101` ke atas melaporkan header yang ada tetapi lemah atau membocorkan
+informasi. Aturan-aturan itu memakai tipe evidence `weak_header_value` dan
+`information_disclosure`, sehingga fingerprint-nya tidak pernah sama dengan
+temuan header-hilang. Setiap aturan bisa dimatikan atau di-re-triase lewat
+file kebijakan.
 
 Label severity adalah label triase berbasis aturan, bukan skor CVSS. Jalankan
 `sentrix rules` untuk melihat daftar yang sama, termasuk apa yang diubah oleh
@@ -374,14 +395,16 @@ Hal berikut belum terselesaikan:
   `localhost`, alamat jaringan privat, atau alamat metadata cloud.
 - Hostname tidak di-resolve atau dicek terhadap rentang alamat privat/reserved,
   dan URL yang sudah menunjuk ke alamat semacam itu diterima.
-- Body respons dibaca penuh ke memori; tidak ada batas ukuran respons.
+- Hanya status line dan header dari respons akhir yang dibaca; body-nya tidak
+  pernah diunduh. httpx tetap membaca body setiap respons redirect perantara
+  sebelum mengikutinya, dan itu tidak dibatasi ukurannya.
 
 ## Rencana
 
 Belum tersedia pada rilis saat ini:
 
-- Kontrol keamanan jaringan: cakupan target, pemeriksaan alamat privat, dan
-  batas ukuran respons (lihat keterbatasan di atas)
+- Kontrol keamanan jaringan: cakupan target dan pemeriksaan alamat privat
+  (lihat keterbatasan di atas)
 - Mengimpor hasil dari alat keamanan lain
 - Penjelasan temuan berbantuan AI yang opsional (analisis intinya akan tetap
   deterministik dan berjalan tanpanya)
