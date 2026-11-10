@@ -458,7 +458,12 @@ def test_summary_without_a_config_file_says_default():
         ('{"severity_overrides": {"HTTP-001": 3}}', "tidak dikenali"),
         ('{"severity_overrides": []}', "tidak dikenali"),
         # A tampered database must not crash the parser or reach the terminal.
-        ("[" * 100_000, "tidak dikenali"),
+        # An explicit id is required: pytest would otherwise build the test id
+        # from these 100,000 characters, and on Windows that overflows the
+        # 32,767-character limit of the PYTEST_CURRENT_TEST variable.
+        pytest.param(
+            "[" * 100_000, "tidak dikenali", id="huge-run-of-open-brackets"
+        ),
         ('{"disabled_rules": ["\\u001b[31mx"]}', "tidak dikenali"),
         ('{"disabled_rules": ["HTTP 005"]}', "tidak dikenali"),
         ('{"severity_overrides": {"HTTP-001": "HI\\nGH"}}', "tidak dikenali"),
