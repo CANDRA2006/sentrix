@@ -24,6 +24,11 @@ deployment, and its threat model, and SENTRIX reports it that way.
 - **HTTP security header checks.** Five rules cover Content-Security-Policy,
   Strict-Transport-Security, X-Content-Type-Options, Referrer-Policy, and
   Permissions-Policy. A header that is absent or empty is a finding.
+- **Header value checks.** Six more rules judge headers that are present: a
+  weak HSTS `max-age`, a CSP that allows inline/eval or any-origin scripts, a
+  `nosniff` typo, a Referrer-Policy that leaks full URLs, and version or
+  technology disclosure in `Server` and `X-Powered-By`. Header values are
+  inspected but never stored in findings, reports, or history.
 - **Evidence-based findings.** Each finding carries a rule id, the evidence
   behind it, a confidence label, a remediation suggestion, and a stable
   fingerprint. Findings are deduplicated and sorted deterministically.
@@ -71,7 +76,9 @@ python -m pip install -e ".[dev]"
 
 ```bash
 sentrix --help
+sentrix --version
 sentrix check https://example.com
+sentrix check https://example.com --timeout 15 --max-redirects 3
 sentrix check https://example.com --output reports/example.json
 sentrix check https://example.com -o reports/example.sarif --format sarif
 sentrix check https://example.com -o reports/example.html --format html
@@ -127,6 +134,18 @@ the JSON report uses English keys.
 | `HTTP-003` | `X-Content-Type-Options` | LOW | Helps prevent MIME-type sniffing. |
 | `HTTP-004` | `Referrer-Policy` | LOW | Controls the referrer information browsers send. |
 | `HTTP-005` | `Permissions-Policy` | INFO | Controls selected browser capabilities. |
+| `HTTP-101` | `Strict-Transport-Security` | LOW | Present, but `max-age` is missing, zero, or under 180 days. Only evaluated for HTTPS responses. |
+| `HTTP-102` | `Content-Security-Policy` | MEDIUM | The effective script policy (`script-src`, else `default-src`) allows `'unsafe-inline'` without a nonce or hash, `'unsafe-eval'`, `*`, `http:`, `https:`, or `data:`. A heuristic, so its confidence is MEDIUM. |
+| `HTTP-103` | `X-Content-Type-Options` | LOW | Present, but the value is not `nosniff`. |
+| `HTTP-104` | `Referrer-Policy` | LOW | The effective (last) policy is `unsafe-url` or `no-referrer-when-downgrade`. |
+| `HTTP-201` | `Server` | LOW | The value includes a version number. |
+| `HTTP-202` | `X-Powered-By` | LOW | The header is present. |
+
+Rules `HTTP-001` to `HTTP-005` report a header that is missing. Rules
+`HTTP-101` and up report a header that is present but weak or revealing. They
+use the evidence types `weak_header_value` and `information_disclosure`, so
+they never share a fingerprint with a missing-header finding. Every rule can be
+switched off or re-triaged in the policy file.
 
 Severity labels are rule-based triage labels, not CVSS scores. Run
 `sentrix rules` to see the same list, including what a policy file changes.
@@ -363,14 +382,16 @@ These are not resolved yet:
   address.
 - Hostnames are not resolved or checked against private/reserved address
   ranges, and URLs that already point at such addresses are accepted.
-- The response body is fully read into memory; there is no response-size limit.
+- Only the status line and headers of the final response are read; its body is
+  never downloaded. httpx does read the body of each intermediate redirect
+  response before following it, and those are not size-limited.
 
 ## Planned
 
 Not available in the current release:
 
-- Network safety controls: target scope, private-address checks, and a
-  response-size limit (see the limitations above)
+- Network safety controls: target scope and private-address checks (see the
+  limitations above)
 - Importing results from other security tools
 - Optional AI-assisted explanations of findings (the core analysis will stay
   deterministic and work without it)

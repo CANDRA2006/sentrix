@@ -59,14 +59,35 @@ LIMITATIONS = [
 ]
 
 
+def _show_version(value: bool) -> None:
+    if value:
+        typer.echo(f"{TOOL_NAME.lower()} {TOOL_VERSION}")
+        raise typer.Exit()
+
+
 @app.callback()
-def main() -> None:
+def main(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        "-V",
+        callback=_show_version,
+        is_eager=True,
+        help="Tampilkan versi lalu keluar.",
+    ),
+) -> None:
     """Local-first security posture analysis CLI."""
 
 
 def validate_url(url: str) -> str:
     """Accept only absolute HTTP or HTTPS URLs."""
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+        # Reading .port raises ValueError for a non-numeric or out-of-range
+        # port; urlsplit itself raises it for e.g. an unclosed IPv6 bracket.
+        parsed.port
+    except ValueError as exc:
+        raise typer.BadParameter("URL tidak valid.") from exc
 
     if parsed.scheme not in {"http", "https"}:
         raise typer.BadParameter("URL harus menggunakan HTTP atau HTTPS.")
@@ -79,8 +100,10 @@ def validate_url(url: str) -> str:
             "Jangan masukkan kredensial ke dalam URL."
         )
 
-    if any(char.isspace() for char in url):
-        raise typer.BadParameter("URL tidak boleh mengandung spasi.")
+    if any(char.isspace() or not char.isprintable() for char in url):
+        raise typer.BadParameter(
+            "URL tidak boleh mengandung spasi atau karakter kontrol."
+        )
 
     return url
 
@@ -220,6 +243,20 @@ def check(
             "lebih tinggi. Menimpa fail_on di file konfigurasi."
         ),
     ),
+    timeout: float = typer.Option(
+        REQUEST_TIMEOUT_SECONDS,
+        "--timeout",
+        min=1.0,
+        max=60.0,
+        help="Batas waktu request dalam detik.",
+    ),
+    max_redirects: int = typer.Option(
+        MAX_REDIRECTS,
+        "--max-redirects",
+        min=0,
+        max=20,
+        help="Jumlah maksimum redirect yang diikuti.",
+    ),
 ) -> None:
     """Inspect basic HTTP security headers for one URL."""
     validate_url(url)
@@ -248,14 +285,18 @@ def check(
 
     try:
         with httpx.Client(
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=timeout,
             follow_redirects=True,
-            max_redirects=MAX_REDIRECTS,
+            max_redirects=max_redirects,
             headers={"User-Agent": f"{TOOL_NAME}/{TOOL_VERSION}"},
         ) as client:
-            response = client.get(url)
+            # stream() reads only the status line and headers, so the body
+            # of the final response is never downloaded.
+            with client.stream("GET", url) as response:
+                pass
 
-    except httpx.HTTPError as exc:
+    # InvalidURL is not an HTTPError subclass, so it needs its own entry.
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
         console.print(
             f"[bold red]Request gagal:[/bold red] {escape(str(exc))}"
         )
