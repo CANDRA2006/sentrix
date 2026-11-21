@@ -34,12 +34,14 @@ from html import escape
 
 from sentrix.history import sanitize_url
 from sentrix.models import SEVERITY_ORDER, Severity, compute_fingerprint
+from sentrix.report.markdown import render_markdown
 
 
 class ReportFormat(StrEnum):
     JSON = "json"
     SARIF = "sarif"
     HTML = "html"
+    MARKDOWN = "markdown"
 
 
 # --- JSON ------------------------------------------------------------------
@@ -405,5 +407,8 @@ def render_report(report: dict, fmt: ReportFormat) -> str:
             return render_sarif(report)
         case ReportFormat.HTML:
             return render_html(report)
+        case ReportFormat.MARKDOWN:
+            from sentrix.report.markdown import render_markdown
+            return render_markdown(report)
         case _:
             raise ValueError(f"Format laporan tidak dikenal: {fmt!r}")
