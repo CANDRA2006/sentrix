@@ -16,6 +16,7 @@ from sentrix.reporting import (
     build_sarif,
     render_html,
     render_json,
+    render_markdown,
     render_report,
     render_sarif,
 )
@@ -427,6 +428,7 @@ def test_rendering_is_deterministic(report, fmt):
         (ReportFormat.JSON, render_json),
         (ReportFormat.SARIF, render_sarif),
         (ReportFormat.HTML, render_html),
+        (ReportFormat.MARKDOWN, render_markdown),
     ],
 )
 def test_render_report_dispatches_to_the_matching_renderer(
@@ -441,7 +443,7 @@ def test_render_report_rejects_unknown_format(report):
 
 
 def test_report_format_values_are_the_cli_spellings():
-    assert [fmt.value for fmt in ReportFormat] == ["json", "sarif", "html"]
+    assert [fmt.value for fmt in ReportFormat] == ["json", "sarif", "html", "markdown"]
 
 
 # --- rule policy in the exports --------------------------------------------
