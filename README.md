@@ -87,6 +87,9 @@ sentrix check https://example.com --config sentrix.toml --fail-on MEDIUM
 sentrix rules --config sentrix.toml
 sentrix history
 sentrix compare 1 2
+sentrix recon example.com --i-have-permission
+sentrix recon example.com --i-have-permission --check-takeover --alive-probe --vhost
+sentrix recon example.com --i-have-permission --category configs,api -o reports/recon.json
 ```
 
 `check` is a required subcommand. Exit codes:
@@ -321,6 +324,30 @@ not a SENTRIX history is never adopted: its tables are checked before an
 upgrade, and a file that does not match is left untouched. Back up
 `~/.sentrix/history.db` first if you want to keep the option of going back to
 an older version.
+
+## Reconnaissance & Attack Surface Mapping
+
+The `recon` subcommand maps target assets, subdomains, open ports, and sensitive files/directories with strict authorization guardrails (`--i-have-permission`):
+
+```bash
+# Basic passive recon & common web ports
+sentrix recon example.com --i-have-permission
+
+# Comprehensive surface analysis (Takeovers, Live probing, VHost discovery)
+sentrix recon example.com --i-have-permission --check-takeover --alive-probe --vhost
+
+# Targeted path discovery by category
+sentrix recon example.com --i-have-permission --category configs,api,backups -o reports/recon.json
+```
+
+Recon Options:
+- `--check-takeover`: Inspects subdomain CNAME records and flags unclaimed dangling cloud services (GitHub Pages, AWS S3, Heroku, Azure, Netlify, Fastly, Ghost, Shopify, Surge, Bitbucket).
+- `--alive-probe`: Checks active HTTP/HTTPS reachability, response codes, page titles (`<title>`), and resolved IPs.
+- `--vhost`: Discovers hidden virtual hosts bound to the same server via Host header permutation.
+- `--category`: Scans targeted sensitive path categories: `configs` (`.env`, `.git`), `api` (Swagger/OpenAPI), `metrics` (Actuator/Prometheus), `backups` (`.sql`, `.zip`), `admin` (login portals), or `all`.
+- `--subdomains / --no-subdomains`: Toggle passive Certificate Transparency enumeration via crt.sh.
+- `--ports / --no-ports`: Toggle gentle connect scans on common web ports.
+- `--rate-limit`: Delay between requests (default: 0.5s).
 
 ## How it works
 

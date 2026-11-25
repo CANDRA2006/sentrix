@@ -91,6 +91,9 @@ sentrix check https://example.com --config sentrix.toml --fail-on MEDIUM
 sentrix rules --config sentrix.toml
 sentrix history
 sentrix compare 1 2
+sentrix recon example.com --i-have-permission
+sentrix recon example.com --i-have-permission --check-takeover --alive-probe --vhost
+sentrix recon example.com --i-have-permission --category configs,api -o reports/recon.json
 ```
 
 `check` adalah subcommand yang wajib ditulis. Exit code:
@@ -334,6 +337,30 @@ riwayat SENTRIX tidak pernah diadopsi: tabelnya diperiksa sebelum peningkatan,
 dan file yang tidak cocok dibiarkan tanpa perubahan. Cadangkan
 `~/.sentrix/history.db` terlebih dahulu jika Anda ingin tetap bisa kembali ke
 versi yang lebih lama.
+
+## Reconnaissance & Pemetaan Permukaan Serang
+
+Subcommand `recon` memetakan aset target, subdomain, port terbuka, dan file/direktori sensitif dengan batasan otorisasi yang ketat (`--i-have-permission`):
+
+```bash
+# Recon pasif & port dasar
+sentrix recon example.com --i-have-permission
+
+# Recon komprehensif (Takeover check, Live probe, VHost discovery)
+sentrix recon example.com --i-have-permission --check-takeover --alive-probe --vhost
+
+# Pemindaian direktori berdasarkan kategori spesifik
+sentrix recon example.com --i-have-permission --category configs,api,backups -o reports/recon.json
+```
+
+Opsi Recon:
+- `--check-takeover`: Menganalisis CNAME subdomain dan mendeteksi layanan cloud yang tidak terklaim (*dangling CNAME* seperti GitHub Pages, AWS S3, Heroku, Azure, Netlify, Fastly, Ghost, Shopify, Surge, Bitbucket).
+- `--alive-probe`: Menguji apakah subdomain merespons protokol HTTP/HTTPS, mencatat status respons, judul halaman (`<title>`), dan alamat IP.
+- `--vhost`: Melakukan permutasi header `Host` untuk menemukan *Virtual Host* internal tersembunyi yang merespons pada alamat IP yang sama.
+- `--category`: Menjalankan wordlist direktori terarah: `configs` (misal `.env`, `.git`), `api` (Swagger/OpenAPI), `metrics` (Actuator/Prometheus), `backups` (`.sql`, `.zip`), `admin` (panel login/admin), atau `all`.
+- `--subdomains / --no-subdomains`: Menyalakan atau mematikan enumerasi subdomain pasif via crt.sh.
+- `--ports / --no-ports`: Memindai web port umum (80, 443, 8080, 8443, 3000, 8000, dll.).
+- `--rate-limit`: Jeda minimum antar-permintaan (default: 0.5 detik).
 
 ## Cara kerja
 
