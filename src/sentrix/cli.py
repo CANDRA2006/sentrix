@@ -1168,7 +1168,11 @@ def recon_command(
     ),
     subdomains: bool = typer.Option(True, "--subdomains/--no-subdomains", help="Enumerasi subdomain pasif via crt.sh."),
     ports: bool = typer.Option(True, "--ports/--no-ports", help="Port check ringan pada web ports umum."),
-    dirs: bool = typer.Option(True, "--dirs/--no-dirs", help="Pemeriksaan direktori sensitif berbasis wordlist kecil."),
+    dirs: bool = typer.Option(True, "--dirs/--no-dirs", help="Pemeriksaan direktori sensitif berbasis wordlist."),
+    category: str | None = typer.Option(None, "--category", help="Kategori wordlist path (configs, api, metrics, backups, admin, all)."),
+    check_takeover: bool = typer.Option(False, "--check-takeover", help="Periksa potensi subdomain takeover (dangling CNAME)."),
+    alive_probe: bool = typer.Option(False, "--alive-probe", help="Uji status aktif (alive), status code, dan title pada subdomain."),
+    vhost: bool = typer.Option(False, "--vhost", help="Uji kandidat virtual host (VHost) via HTTP Host header."),
     output: Path | None = typer.Option(None, "--output", "-o", help="Simpan hasil recon ke file JSON."),
     audit_log: Path | None = typer.Option(None, "--audit-log", help="Path file audit log."),
 ) -> None:
@@ -1190,13 +1194,30 @@ def recon_command(
     console.print(f"\n[bold cyan]SENTRIX[/bold cyan] :: RECONNAISSANCE")
     console.print(f"[dim]Target: {escape(target)} | Rate limit: {rate_limit}s[/dim]\n")
 
-    log_audit_event("recon", target, {"subdomains": subdomains, "ports": ports, "dirs": dirs}, audit_log)
+    log_audit_event(
+        "recon",
+        target,
+        {
+            "subdomains": subdomains,
+            "ports": ports,
+            "dirs": dirs,
+            "category": category,
+            "check_takeover": check_takeover,
+            "alive_probe": alive_probe,
+            "vhost": vhost,
+        },
+        audit_log,
+    )
 
     recon_res = run_recon(
         target,
         ports_scan=ports,
         subdomains_scan=subdomains,
         dirs_scan=dirs,
+        takeovers_scan=check_takeover,
+        alive_scan=alive_probe,
+        vhosts_scan=vhost,
+        dir_category=category,
         rate_limit=rate_limit,
     )
 
@@ -1206,6 +1227,36 @@ def recon_command(
             console.print(f"  - {escape(sub)}")
         if len(recon_res.subdomains) > 20:
             console.print(f"  [dim]... dan {len(recon_res.subdomains) - 20} lainnya[/dim]")
+        console.print()
+
+    if alive_probe and recon_res.alive_subdomains:
+        alive_count = [a for a in recon_res.alive_subdomains if a.alive]
+        console.print(f"[bold]Subdomain aktif (Alive):[/bold] {len(alive_count)}/{len(recon_res.alive_subdomains)}")
+        for a in recon_res.alive_subdomains:
+            if a.alive:
+                ip_info = f" [dim]({a.ip})[/dim]" if a.ip else ""
+                title_info = f" - \"{escape(a.title)}\"" if a.title else ""
+                console.print(f"  - [green]{escape(a.subdomain)}[/green]{ip_info} (HTTP {a.status_code}){title_info}")
+        console.print()
+
+    if check_takeover and recon_res.takeovers:
+        vuln_takeovers = [t for t in recon_res.takeovers if t.vulnerable]
+        if vuln_takeovers:
+            console.print(f"[bold red]POTENSI SUBDOMAIN TAKEOVER TERDETEKSI ({len(vuln_takeovers)}):[/bold red]")
+            for t in vuln_takeovers:
+                console.print(
+                    f"  - [bold red]RENTAN[/bold red] [cyan]{escape(t.subdomain)}[/cyan] -> "
+                    f"[yellow]{escape(t.service)}[/yellow] (CNAME: {escape(t.cname)})"
+                )
+        else:
+            console.print(f"[bold green]Subdomain Takeover Check:[/bold green] {len(recon_res.takeovers)} CNAME layanan pihak ketiga diperiksa, tidak ada yang rentan/unclaimed.")
+        console.print()
+
+    if vhost and recon_res.discovered_vhosts:
+        console.print(f"[bold]Virtual Host Terdeteksi (VHost):[/bold] {len(recon_res.discovered_vhosts)}")
+        for v in recon_res.discovered_vhosts:
+            title_info = f" - \"{escape(v.title)}\"" if v.title else ""
+            console.print(f"  - [yellow]{escape(v.vhost)}[/yellow] (HTTP {v.status_code}, {v.content_length} bytes){title_info}")
         console.print()
 
     if ports:
@@ -1218,7 +1269,8 @@ def recon_command(
     if dirs:
         console.print(f"[bold]Path responsif:[/bold] {len(recon_res.discovered_paths)}")
         for d in recon_res.discovered_paths:
-            console.print(f"  - [cyan]{d.path}[/cyan] (HTTP {d.status_code})")
+            cat_badge = f" [dim cyan]({escape(d.category)})[/dim cyan]" if getattr(d, "category", "") else ""
+            console.print(f"  - [cyan]{d.path}[/cyan]{cat_badge} (HTTP {d.status_code})")
         console.print()
 
     if output is not None:
